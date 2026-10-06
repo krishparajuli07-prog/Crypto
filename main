@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""
+Break a monoalphabetic substitution cipher with letter frequency analysis.
+
+Stage 1: count letters in the ciphertext and map them, by rank, onto the
+         standard English frequency order (ETAOIN SHRDLU ...).  This gives a
+         decent first guess but is rarely perfect on its own.
+Stage 2: hill-climb. Repeatedly swap two letters in the key and keep the swap
+         if the decrypted text looks more like English (scored with common
+         bigrams, trigrams and short words).
+
+Usage:
+    python break_substitution.py                 # decrypts the built-in sample
+    python break_substitution.py cipher.txt      # decrypts a file
+    echo "CIPHERTEXT" | python break_substitution.py -
+"""
+
+import random
+import re
+import string
+import sys
+from collections import Counter
+
+ALPHABET = string.ascii_uppercase
+ENGLISH_ORDER = "ETAOINSHRDLCUMWFGYPBVKJXQZ"
+
+# --- English reference data (kept small and embedded so no files are needed) --
+COMMON_BIGRAMS = ("TH HE IN ER AN RE ND ON EN AT OU ED HA TO OR IT IS HI ES NG "
+                  "ST AR NT TE AS AL EA VE ME SE DE RO LE TI RA CO LI OF NE").split()
+COMMON_TRIGRAMS = ("THE AND ING ENT ION HER FOR THA NTH INT ERE TIO TER EST ERS "
+                   "ATI HAT ATE ALL ETH HES VER HIS OFT ITH FTH STH OTH RES ONT "
+                   "WAS HAD ERE OUR").split()
+COMMON_WORDS = ("THE OF AND TO IN A IS THAT IT WAS FOR AS WITH HIS HE ON BE AT BY "
+                "I THIS HAD NOT ARE BUT FROM OR HAVE AN THEY WHICH ONE YOU WERE "
+                "HER ALL SHE THERE WOULD THEIR WE HIM BEEN HAS WHEN WHO WILL MORE "
+                "NO IF OUT SO SAID WHAT UP ITS ABOUT INTO THAN THEM CAN ONLY OTHER "
+                "NEW SOME COULD TIME THESE TWO MAY THEN DO FIRST ANY MY NOW SUCH "
+                "LIKE OUR OVER MAN ME EVEN MOST MADE AFTER ALSO DID MANY BEFORE").split()
+
+COMMON_ENDINGS = ("ING ED LY ION TION ER ES ENT ANT MENT NESS ITY AL IC OUS IVE "
+                  "ABLE IBLE ISH ISM IST IZE ISE FUL LESS").split()
+RARE_PAIRS = set("JQ QX QZ XJ ZX VQ JX QJ ZQ VK KV WQ QW BQ CQ DQ FQ GQ HQ KQ LQ "
+                 "MQ NQ PQ RQ SQ TQ VJ JV PQ XQ YQ".split())
+
+# Expected English letter frequencies (percent)
+ENGLISH_FREQ = dict(zip(string.ascii_uppercase, [
+    8.17, 1.49, 2.78, 4.25, 12.70, 2.23, 2.02, 6.09, 6.97, 0.15, 0.77, 4.03, 2.41,
+    6.75, 7.51, 1.93, 0.10, 5.99, 6.33, 9.06, 2.76, 0.98, 2.36, 0.15, 1.97, 0.07]))
+
+BIGRAM_SET = set(COMMON_BIGRAMS)
+TRIGRAM_SET = set(COMMON_TRIGRAMS)
+WORD_SET = set(COMMON_WORDS)
+
+
+# --- Helpers ----------------------------------------------------------------
+def decrypt(ciphertext, key):
+    """key maps CIPHER letter -> PLAIN letter. Non-letters pass through."""
+    table = {c: key[c] for c in ALPHABET}
+    out = []
+    for ch in ciphertext:
+        up = ch.upper()
+        if up in table:
+            p = table[up]
+            out.append(p if ch.isupper() else p.lower())
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def frequency_key(ciphertext):
+    """Stage 1: map cipher letters to plain letters by frequency rank."""
+    counts = Counter(c for c in ciphertext.upper() if c in ALPHABET)
+    ranked = [c for c, _ in counts.most_common()]
+    ranked += [c for c in ALPHABET if c not in ranked]      # unseen letters last
+    return {cipher: ENGLISH_ORDER[i] for i, cipher in enumerate(ranked)}
+
+
+def score(text):
+    """Higher = more English-like."""
+    text = text.upper()
+    letters = re.sub(r"[^A-Z]", "", text)
+    s = 0.0
+    # Letter-frequency fit: penalise deviation from English percentages
+    if letters:
+        counts = Counter(letters)
+        n = len(letters)
+        chi2 = sum((100 * counts.get(c, 0) / n - f) ** 2 / f
+                   for c, f in ENGLISH_FREQ.items())
+        s -= 1.5 * chi2
+    for i in range(len(letters) - 1):
+        if letters[i:i + 2] in BIGRAM_SET:
+            s += 1
+    for i in range(len(letters) - 2):
+        if letters[i:i + 3] in TRIGRAM_SET:
+            s += 3
+    # English-specific rules: Q is (almost) always followed by U
+    for i, ch in enumerate(letters):
+        if ch == "Q" and (i + 1 >= len(letters) or letters[i + 1] != "U"):
+            s -= 6
+    for i in range(len(letters) - 1):
+        if letters[i:i + 2] in RARE_PAIRS:
+            s -= 4
+    for w in re.findall(r"[A-Z]+", text):
+        if w in WORD_SET:
+            s += 2 * len(w)
+        elif len(w) > 4:
+            for end in COMMON_ENDINGS:
+                if w.endswith(end):
+                    s += len(end)
+                    break
+    return s
+
+
+def hill_climb(ciphertext, start_key, iterations=4000, restarts=6, seed=1):
+    """Stage 2: refine the key by random swaps, with a few restarts."""
+    rng = random.Random(seed)
+    best_key = dict(start_key)
+    best_score = score(decrypt(ciphertext, best_key))
+
+    for r in range(restarts):
+        key = dict(best_key)
+        if r:  # perturb for restarts so we can escape local maxima
+            for _ in range(4):
+                a, b = rng.sample(ALPHABET, 2)
+                key[a], key[b] = key[b], key[a]
+        cur = score(decrypt(ciphertext, key))
+        for _ in range(iterations):
+            a, b = rng.sample(ALPHABET, 2)
+            key[a], key[b] = key[b], key[a]
+            new = score(decrypt(ciphertext, key))
+            if new >= cur:
+                cur = new
+            else:
+                key[a], key[b] = key[b], key[a]       # undo
+        if cur > best_score:
+            best_score, best_key = cur, dict(key)
+    return best_key
+
+
+def polish(ciphertext, key):
+    """Try every possible pair swap; keep the best; repeat until no gain."""
+    best = score(decrypt(ciphertext, key))
+    improved = True
+    while improved:
+        improved = False
+        for i, a in enumerate(ALPHABET):
+            for b in ALPHABET[i + 1:]:
+                key[a], key[b] = key[b], key[a]
+                new = score(decrypt(ciphertext, key))
+                if new > best:
+                    best, improved = new, True
+                else:
+                    key[a], key[b] = key[b], key[a]
+    return key
+
+
+def break_cipher(ciphertext):
+    key = frequency_key(ciphertext)
+    first_guess = decrypt(ciphertext, key)
+    key = hill_climb(ciphertext, key)
+    key = polish(ciphertext, key)
+    return key, first_guess, decrypt(ciphertext, key)
+
+
+# --- Demo -------------------------------------------------------------------
+SAMPLE = """ZOZM NZGSRHLM GFIRMT DZH Z YIRGRHS NZGSVNZGRXRZM, OLTRXRZM, XIBKGZMZOBHG, ZMW XLNKFGVI HXRVMGRHG. SV DZH SRTSOB RMUOFVMGRZO RM GSV WVEVOLKNVMG LU XLNKFGVI HXRVMXV, KILERWRMT Z ULINZORHZGRLM LU GSV XLMXVKGH LU "ZOTLIRGSN" ZMW "XLNKFGZGRLM" DRGS GSV GFIRMT NZXSRMV. GFIRMT RH DRWVOB XLMHRWVIVW GL YV GSV UZGSVI LU XLNKFGVI HXRVMXV ZMW ZIGRURXRZO RMGVOORTVMXV. WFIRMT DLIOW DZI RR, GFIRMT DLIPVW ULI GSV TLEVIMNVMG XLWV ZMW XBKSVI HXSLLO (TXXH) ZG YOVGXSOVB KZIP, YIRGZRM'H XLWVYIVZPRMT XVMGIV. ULI Z GRNV SV DZH SVZW LU SFG 8, GSV HVXGRLM IVHKLMHRYOV ULI TVINZM MZEZO XIBKGZMZOBHRH. SV WVERHVW Z MFNYVI LU GVXSMRJFVH ULI YIVZPRMT TVINZM XRKSVIH, RMXOFWRMT GSV NVGSLW LU GSV YLNYV, ZM VOVXGILNVXSZMRXZO NZXSRMV GSZG XLFOW URMW HVGGRMTH ULI GSV VMRTNZ NZXSRMV. ZUGVI GSV DZI SV DLIPVW ZG GSV MZGRLMZO KSBHRXZO OZYLIZGLIB, DSVIV SV XIVZGVW LMV LU GSV URIHG WVHRTMH ULI Z HGLIVW-KILTIZN XLNKFGVI, GSV ZXV. RM 1948 GFIRMT QLRMVW NZC MVDNZM'H XLNKFGRMT OZYLIZGLIB ZG NZMXSVHGVI FMREVIHRGB, DSVIV SV ZHHRHGVW RM GSV WVEVOLKNVMG LU GSV NZMXSVHGVI XLNKFGVIH ZMW YVXZNV RMGVIVHGVW RM NZGSVNZGRXZO YRLOLTB. SV DILGV Z KZKVI LM GSV XSVNRXZO YZHRH LU NLIKSLTVMVHRH, ZMW KIVWRXGVW LHXROOZGRMT XSVNRXZO IVZXGRLMH HFXS ZH GSV YVOLFHLE-ASZYLGRMHPB IVZXGRLM, DSRXS DVIV URIHG LYHVIEVW RM GSV 1960H. GFIRMT'H SLNLHVCFZORGB IVHFOGVW RM Z XIRNRMZO KILHVXFGRLM RM 1952, DSVM SLNLHVCFZO ZXGH DVIV HGROO ROOVTZO RM GSV FMRGVW PRMTWLN. SV ZXXVKGVW GIVZGNVMG DRGS UVNZOV SLINLMVH (XSVNRXZO XZHGIZGRLM) ZH ZM ZOGVIMZGREV GL KIRHLM. GFIRMT WRVW RM 1954, QFHG LEVI GDL DVVPH YVULIV SRH 42MW YRIGSWZB, UILN XBZMRWV KLRHLMRMT. ZM RMJFVHG WVGVINRMVW GSZG SRH WVZGS DZH HFRXRWV; SRH NLGSVI ZMW HLNV LGSVIH YVORVEVW SRH WVZGS DZH ZXXRWVMGZO. LM 10 HVKGVNYVI 2009, ULOOLDRMT ZM RMGVIMVG XZNKZRTM, YIRGRHS KIRNV NRMRHGVI TLIWLM YILDM NZWV ZM LUURXRZO KFYORX ZKLOLTB LM YVSZOU LU GSV YIRGRHS TLEVIMNVMG ULI "GSV ZKKZOORMT DZB SV DZH GIVZGVW." ZH LU NZB 2012 Z KIREZGV NVNYVI'H YROO DZH YVULIV GSV SLFHV LU OLIWH DSRXS DLFOW TIZMG GFIRMT Z HGZGFGLIB KZIWLM RU VMZXGVW."""
+
+
+def main():
+    if len(sys.argv) > 1:
+        src = sys.argv[1]
+        ciphertext = sys.stdin.read() if src == "-" else open(src, encoding="utf-8").read()
+    else:
+        ciphertext = SAMPLE
+
+    key, first_guess, plaintext = break_cipher(ciphertext)
+
+    print("=== Letter frequencies in ciphertext ===")
+    counts = Counter(c for c in ciphertext.upper() if c in ALPHABET)
+    total = sum(counts.values())
+    for c, n in counts.most_common(8):
+        print(f"  {c}: {n:4d}  ({100 * n / total:4.1f}%)")
+
+    print("\n=== Stage 1: frequency analysis only (first 300 chars) ===")
+    print(first_guess[:300])
+
+    print("\n=== Stage 2: after refinement ===")
+    print(plaintext)
+
+    print("\n=== Recovered key (cipher -> plain) ===")
+    print("  cipher:", ALPHABET)
+    print("  plain: ", "".join(key[c] for c in ALPHABET))
+
+
+if __name__ == "__main__":
+    main()
